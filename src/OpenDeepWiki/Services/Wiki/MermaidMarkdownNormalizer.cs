@@ -23,6 +23,8 @@ public static partial class MermaidMarkdownNormalizer
             return content;
         }
 
+        content = EnsureMermaidFencesClosed(content);
+
         return MermaidFencePattern.Replace(content, match =>
         {
             var code = match.Groups["code"].Value;
@@ -32,8 +34,82 @@ public static partial class MermaidMarkdownNormalizer
         });
     }
 
+    private static string EnsureMermaidFencesClosed(string content)
+    {
+        content = ClosingMermaidXmlTagPattern().Replace(content, "```");
+        var lines = content.Split('\n');
+        var result = new List<string>(lines.Length + 4);
+        var inMermaid = false;
+
+        foreach (var rawLine in lines)
+        {
+            var cr = rawLine.EndsWith('\r') ? "\r" : string.Empty;
+            var line = cr.Length > 0 ? rawLine[..^1] : rawLine;
+            var trimmed = line.Trim();
+
+            if (!inMermaid)
+            {
+                if (OpeningMermaidFencePattern().IsMatch(trimmed))
+                {
+                    inMermaid = true;
+                }
+                result.Add(rawLine);
+            }
+            else
+            {
+                if (trimmed.StartsWith("```", StringComparison.Ordinal))
+                {
+                    inMermaid = false;
+                    result.Add(rawLine);
+                }
+                else if (trimmed == "---" ||
+                         trimmed.StartsWith("## ", StringComparison.Ordinal) ||
+                         trimmed.StartsWith("### ", StringComparison.Ordinal) ||
+                         (trimmed.StartsWith("| ", StringComparison.Ordinal) && trimmed.EndsWith(" |", StringComparison.Ordinal)))
+                {
+                    result.Add("```" + cr);
+                    result.Add(cr);
+                    inMermaid = false;
+                    result.Add(rawLine);
+                }
+                else
+                {
+                    result.Add(rawLine);
+                }
+            }
+        }
+
+        if (inMermaid)
+        {
+            result.Add("```");
+        }
+
+        return string.Join('\n', result);
+    }
+
     private static string NormalizeMermaidCode(string code)
     {
+        // Fix double-parenthesis cylinder [(( "..." ))] -> [( "..." )] across all diagram types
+        code = DoubleParenCylinderQuotedPattern().Replace(code, "[(\"${label}\")]");
+        code = DoubleParenCylinderUnquotedPattern().Replace(code, "[(\"${label}\")]");
+
+        // Replace unescaped inner double quotes inside edge labels |"..."| with single quotes
+        code = QuotedEdgeLabelPattern().Replace(code, match =>
+        {
+            var inner = match.Groups["inner"].Value;
+            if (!inner.Contains('"', StringComparison.Ordinal))
+            {
+                return match.Value;
+            }
+            var safeInner = inner.Replace("\\\"", "\0").Replace('"', '\'').Replace("\0", "\\\"");
+            return $"|\"{safeInner}\"|";
+        });
+
+        if (IsSequenceDiagram(code))
+        {
+            return NormalizeSequenceDiagramCode(code);
+        }
+
         if (IsFlowchart(code))
         {
             return NormalizeFlowchartCode(code);
@@ -52,8 +128,48 @@ public static partial class MermaidMarkdownNormalizer
         return code;
     }
 
+    private static string NormalizeSequenceDiagramCode(string code)
+    {
+        var lines = code.Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var trimmed = lines[i].TrimStart();
+            if (trimmed.StartsWith("%%", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            var colonIdx = lines[i].IndexOf(':');
+            if (colonIdx > 0)
+            {
+                var prefix = lines[i][..(colonIdx + 1)];
+                var msg = lines[i][(colonIdx + 1)..].Replace(';', ',');
+                lines[i] = prefix + msg;
+            }
+        }
+        return string.Join('\n', lines);
+    }
+
     private static string NormalizeFlowchartCode(string code)
     {
+        var lines = code.Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var fln = lines[i].Replace("<--->", "<-->", StringComparison.Ordinal);
+            fln = LabeledBidirectionalArrowPattern().Replace(fln, "<-->|\"${label}\"|");
+            var revMatch = ReverseBareArrowPattern().Match(fln);
+            if (revMatch.Success && !fln.Contains("-->", StringComparison.Ordinal))
+            {
+                var indent = revMatch.Groups["indent"].Value;
+                var leftNode = revMatch.Groups["left"].Value.Trim();
+                var rightExpr = revMatch.Groups["right"].Value.Trim();
+                var safeId = "src_" + NonAlnumPattern().Replace(rightExpr, "_").Trim('_');
+                if (safeId.Length > 28) safeId = safeId[..28];
+                fln = $"{indent}{safeId}[\"{EscapeLabel(rightExpr)}\"] --> {leftNode}";
+            }
+            lines[i] = fln;
+        }
+        code = string.Join('\n', lines);
+
         var normalized = MermaidFlowchartIdNormalizer.Normalize(code);
 
         normalized = FlowchartSquareLabelPattern().Replace(normalized, match =>
@@ -401,10 +517,50 @@ public static partial class MermaidMarkdownNormalizer
         return false;
     }
 
+    private static bool IsSequenceDiagram(string code)
+    {
+        foreach (var line in code.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0 || trimmed.StartsWith("%%", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            return trimmed.StartsWith("sequenceDiagram", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
+    }
+
     private static string EscapeLabel(string label)
     {
         return label.Replace("\\", "\\\\").Replace("\"", "\\\"");
     }
+
+    [GeneratedRegex(@"^[ \t]*</mermaid>[ \t]*$", RegexOptions.Multiline | RegexOptions.IgnoreCase)]
+    private static partial Regex ClosingMermaidXmlTagPattern();
+
+    [GeneratedRegex(@"^```\s*mermaid\b", RegexOptions.IgnoreCase)]
+    private static partial Regex OpeningMermaidFencePattern();
+
+    [GeneratedRegex(@"\[\(\(\s*""(?<label>[^""]*)""\s*\)\)\]")]
+    private static partial Regex DoubleParenCylinderQuotedPattern();
+
+    [GeneratedRegex(@"\[\(\(\s*(?<label>[^\)]*?)\s*\)\)\]")]
+    private static partial Regex DoubleParenCylinderUnquotedPattern();
+
+    [GeneratedRegex(@"\|""(?<inner>[^\r\n|]*)""\|")]
+    private static partial Regex QuotedEdgeLabelPattern();
+
+    [GeneratedRegex(@"<--\s*""(?<label>[^""]+)""\s*-->")]
+    private static partial Regex LabeledBidirectionalArrowPattern();
+
+    [GeneratedRegex(@"^(?<indent>\s*)(?<left>.+?)\s*<--\s*(?<right>[A-Za-z0-9_(),\s]+?)\s*\r?$")]
+    private static partial Regex ReverseBareArrowPattern();
+
+    [GeneratedRegex(@"[^A-Za-z0-9_]+")]
+    private static partial Regex NonAlnumPattern();
 
     [GeneratedRegex(@"(?<prefix>\b[A-Za-z_][A-Za-z0-9_]*\s*)\[(?<label>[^\]\r\n]+)\]")]
     private static partial Regex FlowchartSquareLabelPattern();

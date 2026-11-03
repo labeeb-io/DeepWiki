@@ -82,10 +82,9 @@ function cleanupMermaidErrors(diagramId: string) {
     dElement.remove();
   }
   
-  // 清理 body 直接子元素中的 mermaid 错误元素
-  document.querySelectorAll('body > div[id^="mermaid-"], body > div[id^="d"], body > svg[id^="mermaid-"]').forEach((el) => {
-    // 检查是否是 mermaid 错误元素（通常包含错误文本或是空的 svg）
-    if (el.textContent?.includes('Syntax error') || el.innerHTML === '') {
+  // 仅清理明确包含 Syntax error 的残留错误元素
+  document.querySelectorAll('body > div[id^="mermaid-"], body > svg[id^="mermaid-"]').forEach((el) => {
+    if (el.textContent?.includes('Syntax error')) {
       el.remove();
     }
   });
@@ -274,8 +273,12 @@ function MermaidDiagram({ code, isDark, locale }: { code: string; isDark: boolea
   }, []);
 
   useEffect(() => {
+    let isMounted = true;
+    const cleanId = id.replace(/[^a-zA-Z0-9]/g, "");
+    const uniqueSuffix = Math.random().toString(36).substring(2, 8);
+    const diagramId = `mermaid-${cleanId || "diagram"}-${uniqueSuffix}`;
+
     const renderDiagram = async () => {
-      const diagramId = `mermaid-${id}`;
       try {
         const mermaid = (await import("mermaid")).default;
         mermaid.initialize({
@@ -286,18 +289,25 @@ function MermaidDiagram({ code, isDark, locale }: { code: string; isDark: boolea
         });
 
         const { svg } = await mermaid.render(diagramId, code);
-        setSvg(svg);
-        setError("");
+        if (isMounted) {
+          setSvg(svg);
+          setError("");
+        }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to render diagram");
-        setSvg("");
+        if (isMounted) {
+          setError(err instanceof Error ? err.message : "Failed to render diagram");
+          setSvg("");
+        }
       } finally {
-        // 无论成功失败，都清理可能残留的错误元素
         cleanupMermaidErrors(diagramId);
       }
     };
 
     renderDiagram();
+
+    return () => {
+      isMounted = false;
+    };
   }, [code, isDark, id]);
 
   if (error) {

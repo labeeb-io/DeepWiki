@@ -115,6 +115,29 @@ public class RepositoryAnalyzer : IRepositoryAnalyzer
             return (await GetGitCliBranchHeadCommitAsync(localGitSource.RepositoryPath, branchName, cancellationToken))?.CommitId;
         }
 
+        if (sourceInfo.SourceType == RepositorySourceType.LocalDirectory &&
+            TryResolveMonorepoSubdirectorySource(sourceInfo.Location, out var monorepoRoot, out _, out _))
+        {
+            using (var localRepository = new GitRepository(monorepoRoot))
+            {
+                var commitId = await Task.Run(() =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return ResolveLocalSourceBranchTip(localRepository, branchName)?.Sha ?? localRepository.Head.Tip?.Sha;
+                }, cancellationToken);
+
+                if (!string.IsNullOrWhiteSpace(commitId))
+                {
+                    return commitId;
+                }
+            }
+
+            return (await GetGitCliBranchHeadCommitAsync(
+                monorepoRoot,
+                branchName,
+                cancellationToken))?.CommitId;
+        }
+
         if (sourceInfo.SourceType == RepositorySourceType.LocalDirectory)
         {
             _logger.LogInformation(
@@ -225,6 +248,18 @@ public class RepositoryAnalyzer : IRepositoryAnalyzer
             workspace.CommitId = GetHeadCommitId(workspace.WorkingDirectory);
             workspace.SupportsIncrementalUpdates = true;
         }
+        else if (TryResolveMonorepoSubdirectorySource(workspace.SourceLocation, out var monorepoRoot, out var subPath, out var monorepoReason))
+        {
+            _logger.LogInformation(
+                "Decoded local source path is a Monorepo subdirectory. SourcePath: {SourcePath}, MonorepoRoot: {MonorepoRoot}, SubPath: {SubPath}",
+                workspace.SourceLocation, monorepoRoot, subPath);
+
+            await PrepareLocalDirectoryWorkspaceAsync(workspace, cancellationToken);
+            workspace.MonorepoRootPath = monorepoRoot;
+            workspace.MonorepoSubPath = subPath;
+            workspace.CommitId = GetHeadCommitId(monorepoRoot);
+            workspace.SupportsIncrementalUpdates = true;
+        }
         else
         {
             if (workspace.SourceType == RepositorySourceType.LocalDirectory)
@@ -327,10 +362,17 @@ public class RepositoryAnalyzer : IRepositoryAnalyzer
             "Getting changed files. Repository: {Org}/{Repo}, FromCommit: {FromCommit}, ToCommit: {ToCommit}",
             workspace.Organization, workspace.RepositoryName, fromCommitId, toCommitId);
 
-        var changedFiles = GetChangedFilesBetweenCommits(
-            workspace.WorkingDirectory, 
-            fromCommitId, 
-            toCommitId);
+        var changedFiles = !string.IsNullOrEmpty(workspace.MonorepoRootPath) && !string.IsNullOrEmpty(workspace.MonorepoSubPath)
+            ? GetChangedFilesForMonorepoSubPath(
+                workspace.MonorepoRootPath,
+                workspace.MonorepoSubPath,
+                workspace.WorkingDirectory,
+                fromCommitId,
+                toCommitId)
+            : GetChangedFilesBetweenCommits(
+                workspace.WorkingDirectory, 
+                fromCommitId, 
+                toCommitId);
 
         stopwatch.Stop();
         _logger.LogInformation(
@@ -683,6 +725,66 @@ public class RepositoryAnalyzer : IRepositoryAnalyzer
 
         failureReason = $"LibGit2 exact workdir failed: {failureReason}; git CLI exact workdir failed: {cliFailureReason}";
         return false;
+    }
+
+    private bool TryResolveMonorepoSubdirectorySource(
+        string path,
+        out string monorepoRoot,
+        out string subPath,
+        out string failureReason)
+    {
+        monorepoRoot = string.Empty;
+        subPath = string.Empty;
+        failureReason = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+        {
+            failureReason = $"Path does not exist: {path}";
+            return false;
+        }
+
+        try
+        {
+            var discoveredPath = GitRepository.Discover(path);
+            if (string.IsNullOrWhiteSpace(discoveredPath))
+            {
+                failureReason = $"No Git repository discovered for path: {path}";
+                return false;
+            }
+
+            using var repo = new GitRepository(discoveredPath);
+            var gitWorkDir = repo.Info.WorkingDirectory;
+            if (string.IsNullOrWhiteSpace(gitWorkDir))
+            {
+                failureReason = $"Git working directory is empty for: {discoveredPath}";
+                return false;
+            }
+
+            var cleanGitWorkDir = Path.GetFullPath(gitWorkDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var cleanPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+            if (LocalPathEquals(cleanGitWorkDir, cleanPath))
+            {
+                failureReason = "Path is the Git root itself";
+                return false;
+            }
+
+            if (cleanPath.StartsWith(cleanGitWorkDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                cleanPath.StartsWith(cleanGitWorkDir + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            {
+                monorepoRoot = cleanGitWorkDir;
+                subPath = Path.GetRelativePath(cleanGitWorkDir, cleanPath).Replace('\\', '/');
+                return true;
+            }
+
+            failureReason = $"Path {cleanPath} is not under Git workdir {cleanGitWorkDir}";
+            return false;
+        }
+        catch (Exception ex)
+        {
+            failureReason = ex.Message;
+            return false;
+        }
     }
 
     private static Commit? ResolveLocalSourceBranchTip(GitRepository repository, string branchName)
@@ -1734,6 +1836,92 @@ public class RepositoryAnalyzer : IRepositoryAnalyzer
                 case ChangeKind.Deleted:
                     // We might want to track deleted files separately
                     // For now, we don't include them in the changed files list
+                    break;
+            }
+        }
+
+        return changedFiles.ToArray();
+    }
+
+    private string[] GetChangedFilesForMonorepoSubPath(
+        string monorepoRoot,
+        string subPath,
+        string workingDirectory,
+        string fromCommitId,
+        string toCommitId)
+    {
+        using var repo = new GitRepository(monorepoRoot);
+
+        var fromCommit = repo.Lookup<Commit>(fromCommitId);
+        var toCommit = repo.Lookup<Commit>(toCommitId);
+
+        if (fromCommit == null)
+        {
+            _logger.LogWarning("From commit {CommitId} not found in monorepo, returning all tracked files", fromCommitId);
+            return GetAllTrackedFiles(workingDirectory);
+        }
+
+        if (toCommit == null)
+        {
+            throw new InvalidOperationException($"To commit {toCommitId} not found in monorepo");
+        }
+
+        var changes = repo.Diff.Compare<TreeChanges>(fromCommit.Tree, toCommit.Tree);
+        var changedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var subPrefixes = new List<(string TargetSubPath, string PrefixInWorkspace)>();
+        var normalizedMainSubPath = subPath.Replace('\\', '/').Trim('/') + "/";
+        subPrefixes.Add((normalizedMainSubPath, string.Empty));
+
+        try
+        {
+            if (Directory.Exists(workingDirectory))
+            {
+                foreach (var entry in new DirectoryInfo(workingDirectory).GetFileSystemInfos())
+                {
+                    if (IsSymbolicLink(entry))
+                    {
+                        var target = entry.LinkTarget;
+                        if (!string.IsNullOrEmpty(target))
+                        {
+                            var resolvedTarget = Path.GetFullPath(Path.Combine(workingDirectory, target));
+                            var cleanMonorepoRoot = Path.GetFullPath(monorepoRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                            if (resolvedTarget.StartsWith(cleanMonorepoRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                                resolvedTarget.StartsWith(cleanMonorepoRoot + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                            {
+                                var relTarget = Path.GetRelativePath(cleanMonorepoRoot, resolvedTarget).Replace('\\', '/').Trim('/') + "/";
+                                subPrefixes.Add((relTarget, entry.Name.Trim('/') + "/"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to inspect symlinks in workspace {WorkingDirectory}", workingDirectory);
+        }
+
+        foreach (var change in changes)
+        {
+            switch (change.Status)
+            {
+                case ChangeKind.Added:
+                case ChangeKind.Modified:
+                case ChangeKind.Renamed:
+                case ChangeKind.Copied:
+                    var changePath = change.Path.Replace('\\', '/');
+                    foreach (var (targetSubPath, prefixInWorkspace) in subPrefixes)
+                    {
+                        if (changePath.StartsWith(targetSubPath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var relPath = changePath[targetSubPath.Length..];
+                            var finalRelPath = string.IsNullOrEmpty(prefixInWorkspace)
+                                ? relPath
+                                : prefixInWorkspace + relPath;
+                            changedFiles.Add(finalRelPath);
+                        }
+                    }
                     break;
             }
         }

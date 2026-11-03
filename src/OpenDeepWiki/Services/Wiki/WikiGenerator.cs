@@ -304,7 +304,7 @@ Execute the workflow now. The runtime context already contains the directory tre
 - Project Type: {repoContext.ProjectType}
 - Target Language: {branchLanguage.LanguageCode}
 - Key Files: {string.Join(", ", repoContext.KeyFiles)}
-- Entry Points: {string.Join(", ", repoContext.EntryPoints.Take(5))}
+- Entry Points: {string.Join(", ", repoContext.EntryPoints.Take(10))}
 
 ## Entry Points
 
@@ -317,6 +317,24 @@ Execute the workflow now. The runtime context already contains the directory tre
 ## README
 
 {repoContext.ReadmeContent}";
+
+            if (!string.IsNullOrWhiteSpace(repoContext.DiscoveryMapContent))
+            {
+                _logger.LogInformation(
+                    "Injecting Precomputed Capability Map into Catalog Generator. Repository: {Org}/{Repo}, Length: {Length} chars",
+                    workspace.Organization, workspace.RepositoryName, repoContext.DiscoveryMapContent.Length);
+                userMessage += $@"
+
+## Precomputed Capability & Entrypoint Map (GitNexus + AST Verified)
+
+The following precomputed capability map was extracted deterministically from the repository's AST, Route table, Queue dispatches, Leiden functional clusters, and execution flows.
+MANDATORY COVERAGE GATE:
+1. Every discovered Capability Cluster (`CAP-*`) and its verified Entrypoints MUST be covered by a dedicated leaf page or explicitly grouped into a justified domain leaf. Do NOT ignore any capability cluster.
+2. Do NOT impose any artificial cap on the number of sections or leaf pages; scale the catalog tree to cover all discovered capabilities.
+3. Honor all `Incomplete / Unlinked Routes` warnings: do NOT invent controllers or features for routes flagged with an `evidence_gap`.
+
+{repoContext.DiscoveryMapContent}";
+            }
 
             var catalogAi = await ResolveCatalogModelAsync(cancellationToken);
             await ExecuteAgentWithRetryAsync(
@@ -815,29 +833,26 @@ Please start executing the task.";
                 "content-generator",
                 cancellationToken: cancellationToken);
 
+            var discoveryMap = ReadDiscoveryMapContent(new DirectoryInfo(workspace.WorkingDirectory), workspace.RepositoryName);
+
             var userMessage = $@"Please generate Wiki document content for the catalog item described in the runtime context.
 
 ## Task Requirements
 
 1. **Gather Source Material**
    - Source-discovery budget: at most {_options.MaxDocumentSourceToolCalls} total calls across ListFiles, Grep, and ReadFile for this page.
-   - Use at most 1-2 ListFiles/Grep calls to find source files related to the runtime catalog title.
-   - Read only the top 2-4 key implementation/configuration files. Use small excerpts; do not read whole large files.
+   - Start from the Precomputed Capability & Entrypoint Reference (if provided below) to identify the exact verified routes, controllers, queue jobs, and models for this topic without wasting calls on blind directory scans.
+   - Use ReadFile and Grep to inspect the full end-to-end operational chain (entry point, orchestrator/action, external calls, persistence, and error handling).
    - When any source tool reports SOURCE_TOOL_BUDGET_REACHED, immediately stop exploring and write the document with the evidence already collected.
 
-2. **Document Structure** (Must Include)
-   - Title (H1): Must match catalog title
-   - Purpose and Scope: Explain what this page covers and what related catalog topics are intentionally left to sibling pages
-   - Overview: Explain purpose and use cases
-   - Architecture Diagram: Use Mermaid to illustrate component relationships, data flow, or system architecture
-   - Main Content: Deep, detailed explanation of implementation, architecture, and real control flow (use multiple subsections)
-   - Usage Examples: Multiple code examples extracted from actual source code
-   - Configuration Options (if applicable): List options in table format
-   - API Reference (if applicable): Method signatures, parameters, return values
-   - Failure Modes, Edge Cases & Concurrency (when source evidence exists)
-   - Performance / Operational notes and Extension Points (when applicable)
-   - Related Links: Links to related documentation and source files
-   - This is a right-sized DeepWiki-style catalog, so each leaf page must be a concise, source-backed reference for its specific topic — not a catch-all replacement for sibling pages
+2. **Document Structure & System Knowledge Mission**
+   - Strictly follow the System Knowledge Wiki mission, Knowledge Archetype, and anti-duplication invariants defined in your system prompt (`content-generator.md`).
+   - Our objective is NOT code documentation: write an evidence-backed System Knowledge Wiki explaining how the platform operates (capabilities, workflows, service interactions, data flow, decisions, persistence, and failure handling).
+   - NEVER use file names or class names as section headings (e.g., `### SomeClass.php` is strictly forbidden).
+   - NEVER dump raw source-code blocks (` ```php `, ` ```python `, ` ```ts `). Express schemas, contracts, and decision gates using Markdown tables, Mermaid diagrams, and inline code citations.
+   - Open with the H1 catalog title and status badge. Do NOT create redundant file-list boxes in the header; all participating source files belong in the Component Inventory Table. Never output raw HTML tags like `<cite>`, `<aside>`, `<details>`, or `<summary>`; use native Markdown only.
+   - Do NOT create separate 'Purpose & Scope' and 'Overview' sections. Synthesize purpose, boundary, and ownership into a single opening section.
+   - Place the high-density Component Inventory Table immediately after the opening boundary or architecture diagram.
 
 3. **File Reference Links** (IMPORTANT)
    - When referencing source files, use the actual runtime File Reference Base URL shown below
@@ -845,7 +860,6 @@ Please start executing the task.";
    - Use the exact runtime File Reference Base URL prefix shown in the example; never output literal placeholder text for the base URL
    - For specific line references, append #L<line_number> or #L<start>-L<end> to the real file URL
    - Always provide clickable links to source files mentioned in the document
-   - Do NOT add a source-file list section to the Markdown body; source files are tracked and rendered separately by the framework
 
 4. **Mermaid Diagram Requirements** (IMPORTANT)
    - Include at least one architecture or flow diagram using Mermaid
@@ -872,58 +886,32 @@ Please start executing the task.";
      * Always wrap flowchart edge labels in double quotes when using pipe syntax: `A -->|""Yes (Claude)""| B`
      * Labels containing `()`, `/`, `.`, `<br/>`, spaces, non-English text, or punctuation MUST be quoted
      * Escape special characters in labels properly
-     * Keep diagrams focused and readable (max 15-20 nodes per diagram)
-     * Use subgraph for grouping related components
-   - Example — BAD (subgraph ID collides with node ID; causes render cycle error):
-     ```mermaid
-     flowchart TD
-         subgraph SetupManager[""Setup Manager""]
-             SetupManager[""SetupManager""]
-         end
-         Other --> SetupManager
-     ```
-   - Example — GOOD (subgraph uses `sg_` prefix; edges reference the node):
-     ```mermaid
-     flowchart TD
-         subgraph sg_SetupManager[""Setup Manager""]
-             SetupManager[""SetupManager""]
-         end
-         Other --> SetupManager
-     ```
-   - Example valid Mermaid syntax:
-     ```mermaid
-     flowchart TD
-         subgraph sg_Core[""Core Components""]
-             A[""Service Layer""] --> B[""Repository""]
-             B --> C[(Database)]
-         end
-         D[""API Controller""] -->|""calls (HTTP)""| A
-     ```
+     * Keep diagrams focused, readable, and structured: strictly 7 to 14 nodes, organized into 3 chronological horizontal subgraphs (`sg_Inlet` [1. Trigger/Admission], `sg_Core` [2. Core Processing], `sg_Storage` [3. Persistence/State])
+     * Use semantic node shapes: `[""Class / Service""]` for code components, `[(""Database Table / Cache"")]` for persistence, `{{""Decision / Policy Gate?""}}` for branching checks, `[[""Queue Job""]]` for async workers
+     * Edge labels must be 1 to 4 words representing data payloads or protocols (e.g. `-->|""payload_json""|`), NEVER full prose sentences
+     * Use `sg_` prefix for all subgraphs (e.g., `sg_Inlet`, `sg_Core`, `sg_Storage`)
 
 5. **Content Quality Requirements**
    - All information must be based on actual source code, do not fabricate
-   - Code examples must be extracted from repository with syntax highlighting
-   - Explain design intent (WHY), not just description (WHAT)
+   - Explain operational behavior, decision policies, state transitions, and failure recovery (WHY and HOW), not code syntax
    - Write document content in the runtime target language
    - Keep code identifiers in original form, do not translate
 
 6. **Output Requirements**
-     - Write the document INCREMENTALLY so its length is not capped by a single response:
-     * Call WriteDoc(content) first with the title, purpose and scope, overview, and architecture section
-     * Then call AppendDoc(content) only when a major required section does not fit in WriteDoc
+   - Write the document INCREMENTALLY so its length is not capped by a single response:
+     * Call WriteDoc(content) first with the title, opening synthesis, diagram, component inventory table, and core workflow sections
+     * Then call AppendDoc(content) when additional major sections (persistence, decision gates, failure matrix) do not fit in WriteDoc
    - AppendDoc budget: at most {_options.MaxDocumentAppendOperations} calls for this page. When the budget is reached, stop appending and provide the final summary.
-   - Keep the page bounded; prioritize the most important architecture, workflow, configuration, and source-code entry points.
    - Source files are automatically tracked from files you read
 
 ## Execution Steps
 
-1. Analyze catalog title to determine document scope (treat it as a broad subsystem)
-2. Use ListFiles and Grep sparingly to find related source files
-3. Read a small number of key files, extract information and code examples
-4. Design appropriate Mermaid diagrams to illustrate architecture/flow
-5. Organize content following document structure template
-6. Ensure all file references use the correct URL format with branch
-7. Call WriteDoc(content), then at most the configured AppendDoc budget for remaining major sections. Stop when source or append budget is reached.
+1. Locate the capability in the Precomputed Capability Reference (when present) and identify its entry points, jobs, and models
+2. Read the key source files across the full operational chain (entry point -> orchestration -> persistence/recovery)
+3. Design clear Mermaid diagrams (`sg_Inlet`, `sg_Core`, `sg_Storage`) and structured operational tables
+4. Organize content by system capability, workflow stages, decision policies, and failure handling (never by file name)
+5. Ensure all file references use the correct URL format with branch
+6. Call WriteDoc(content), then at most the configured AppendDoc budget for remaining major sections.
 
 ## Runtime Context
 
@@ -933,9 +921,20 @@ Please start executing the task.";
 - File Reference Base URL: {gitBaseUrl}
 - Target Language: {branchLanguage.LanguageCode}
 - Catalog Path: {catalogPath}
-- Catalog Title: {catalogTitle}
+- Catalog Title: {catalogTitle}";
 
-Please start executing the task.";
+            if (!string.IsNullOrWhiteSpace(discoveryMap))
+            {
+                userMessage += $@"
+
+## Precomputed Capability & Entrypoint Reference (GitNexus + AST Verified)
+
+Use this verified map to jump directly to the relevant entrypoints, handlers, queue jobs, and models for `{catalogTitle}` (`{catalogPath}`). Honor all `Incomplete / Unlinked Routes` warnings:
+
+{discoveryMap}";
+            }
+
+            userMessage += "\n\nPlease start executing the task.";
 
             var contentAi = await ResolveContentModelAsync(cancellationToken);
             {
@@ -2477,6 +2476,9 @@ Translated mind map:";
             
             // 5. Identify entry points based on project type
             context.EntryPoints = IdentifyEntryPoints(rootDir, context.ProjectType);
+
+            // 6. Read Precomputed Capability & Entrypoint Map (if available)
+            context.DiscoveryMapContent = ReadDiscoveryMapContent(rootDir, rootDir.Name);
             
             return context;
         }, cancellationToken);
@@ -2512,6 +2514,22 @@ Translated mind map:";
     {
         var types = new List<string>();
         
+        // Check for PHP / Laravel
+        if (File.Exists(Path.Combine(rootDir.FullName, "composer.json")))
+        {
+            if (File.Exists(Path.Combine(rootDir.FullName, "artisan")))
+                types.Add("php-laravel");
+            else
+                types.Add("php");
+        }
+
+        // Check for Cloudflare Worker
+        if (File.Exists(Path.Combine(rootDir.FullName, "wrangler.toml")) ||
+            File.Exists(Path.Combine(rootDir.FullName, "wrangler.jsonc")))
+        {
+            types.Add("cloudflare-worker");
+        }
+
         // Check for various project types
         if (rootDir.GetFiles("*.csproj", SearchOption.AllDirectories).Any() ||
             rootDir.GetFiles("*.sln").Any())
@@ -2749,6 +2767,18 @@ Translated mind map:";
             var pyFiles = new[] { "requirements.txt", "pyproject.toml", "setup.py" };
             keyFiles.AddRange(pyFiles.Where(f => File.Exists(Path.Combine(rootDir.FullName, f))));
         }
+
+        if (projectType.Contains("php"))
+        {
+            var phpFiles = new[] { "composer.json", "artisan", "bootstrap/app.php", "routes/api.php", "routes/web.php", "routes/console.php" };
+            keyFiles.AddRange(phpFiles.Where(f => File.Exists(Path.Combine(rootDir.FullName, f))));
+        }
+
+        if (projectType.Contains("cloudflare"))
+        {
+            var cfFiles = new[] { "wrangler.toml", "wrangler.jsonc", "src/index.ts" };
+            keyFiles.AddRange(cfFiles.Where(f => File.Exists(Path.Combine(rootDir.FullName, f))));
+        }
         
         return keyFiles.Distinct().ToList();
     }
@@ -2760,6 +2790,35 @@ Translated mind map:";
     {
         var entryPoints = new List<string>();
         
+        if (projectType.Contains("php"))
+        {
+            var phpEntries = new[] { "routes/api.php", "routes/web.php", "routes/console.php", "bootstrap/app.php", "public/index.php" };
+            foreach (var entry in phpEntries)
+            {
+                if (File.Exists(Path.Combine(rootDir.FullName, entry)))
+                    entryPoints.Add(entry);
+            }
+            var modulesDir = Path.Combine(rootDir.FullName, "modules");
+            if (Directory.Exists(modulesDir))
+            {
+                var moduleRoutes = new DirectoryInfo(modulesDir)
+                    .GetFiles("*.php", SearchOption.AllDirectories)
+                    .Where(f => f.DirectoryName != null && f.DirectoryName.EndsWith("routes", StringComparison.OrdinalIgnoreCase))
+                    .Take(6);
+                entryPoints.AddRange(moduleRoutes.Select(f => Path.GetRelativePath(rootDir.FullName, f.FullName).Replace('\\', '/')));
+            }
+        }
+
+        if (projectType.Contains("cloudflare"))
+        {
+            var cfEntries = new[] { "src/index.ts", "src/worker.ts" };
+            foreach (var entry in cfEntries)
+            {
+                if (File.Exists(Path.Combine(rootDir.FullName, entry)))
+                    entryPoints.Add(entry);
+            }
+        }
+
         if (projectType.Contains("dotnet"))
         {
             // Find Program.cs, Startup.cs
@@ -2802,7 +2861,56 @@ Translated mind map:";
             entryPoints.AddRange(files.Select(f => Path.GetRelativePath(rootDir.FullName, f.FullName).Replace('\\', '/')));
         }
         
-        return entryPoints.Distinct().Take(10).ToList();
+        return entryPoints.Distinct().Take(15).ToList();
+    }
+
+    /// <summary>
+    /// Reads the precomputed GitNexus + AST discovery map markdown for the repository if available.
+    /// </summary>
+    private static string ReadDiscoveryMapContent(DirectoryInfo rootDir, string? repoName)
+    {
+        var resolvedName = repoName;
+        if (string.IsNullOrWhiteSpace(resolvedName) || string.Equals(resolvedName, "tree", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!string.IsNullOrWhiteSpace(rootDir.LinkTarget))
+            {
+                resolvedName = Path.GetFileName(rootDir.LinkTarget.TrimEnd('/', '\\'));
+            }
+            else if (rootDir.Parent?.Parent?.Parent != null &&
+                     string.Equals(rootDir.Parent.Parent.Name, "branches", StringComparison.OrdinalIgnoreCase))
+            {
+                resolvedName = rootDir.Parent.Parent.Parent.Name;
+            }
+        }
+
+        var candidates = new List<string>
+        {
+            Path.Combine(rootDir.FullName, "discovery-map.md"),
+            Path.Combine(rootDir.FullName, ".discovery", "discovery-map.md")
+        };
+
+        if (!string.IsNullOrWhiteSpace(resolvedName))
+        {
+            candidates.Add(Path.Combine("/labeeb/wiki/discovery", resolvedName, "discovery-map.md"));
+            candidates.Add(Path.GetFullPath(Path.Combine(rootDir.FullName, "..", "wiki", "discovery", resolvedName, "discovery-map.md")));
+        }
+
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                if (File.Exists(candidate))
+                {
+                    return File.ReadAllText(candidate);
+                }
+            }
+            catch
+            {
+                // Ignore inaccessible paths and continue checking candidates
+            }
+        }
+
+        return string.Empty;
     }
 
     /// <summary>
@@ -2815,6 +2923,7 @@ Translated mind map:";
         public string ReadmeContent { get; set; } = "";
         public List<string> KeyFiles { get; set; } = new();
         public List<string> EntryPoints { get; set; } = new();
+        public string DiscoveryMapContent { get; set; } = "";
     }
 
     /// <summary>

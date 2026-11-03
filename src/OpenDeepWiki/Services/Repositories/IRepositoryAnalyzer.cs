@@ -119,6 +119,16 @@ public class RepositoryWorkspace
     public string GitUrl { get; set; } = string.Empty;
 
     /// <summary>
+    /// For monorepo subdirectories, the root git repository path.
+    /// </summary>
+    public string? MonorepoRootPath { get; set; }
+
+    /// <summary>
+    /// For monorepo subdirectories, the relative subpath within the monorepo root.
+    /// </summary>
+    public string? MonorepoSubPath { get; set; }
+
+    /// <summary>
     /// Indicates whether this repository source supports incremental updates.
     /// </summary>
     public bool SupportsIncrementalUpdates { get; set; } = true;

@@ -875,6 +875,11 @@ Communities:
             startInfo.Environment["OPENAI_API_KEY"] = openAiApiKey;
         }
 
+        if (!string.IsNullOrWhiteSpace(openAiBaseUrl))
+        {
+            startInfo.Environment["OPENAI_BASE_URL"] = openAiBaseUrl;
+        }
+
         if (environment != null)
         {
             foreach (var item in environment)

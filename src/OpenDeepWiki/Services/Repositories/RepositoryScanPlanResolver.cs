@@ -13,10 +13,10 @@ public sealed class RepositoryScanPlanResolver(IOptionsMonitor<WikiGeneratorOpti
     : IRepositoryScanPlanResolver
 {
     private const int MinDirectoryDepth = 2;
-    private const int MaxDirectoryDepth = 4;
-    private const int MaxTreeNodeBudget = 1500;
-    private const int MaxFilesPerDirectoryBudget = 30;
-    private const int MaxTotalFileBudget = 800;
+    private const int MaxDirectoryDepth = 8;
+    private const int MaxTreeNodeBudget = 3000;
+    private const int MaxFilesPerDirectoryBudget = 50;
+    private const int MaxTotalFileBudget = 2500;
 
     public ResolvedRepositoryScanPlan Resolve(Repository repository)
     {
